@@ -1,0 +1,7 @@
+numpy
+scipy
+matplotlib
+osqp
+cvxpy
+pillow
+gradio
