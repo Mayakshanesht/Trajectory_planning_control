@@ -1,7 +1,10 @@
-numpy
-scipy
-matplotlib
+numpy==1.26.4
+scipy==1.13.1
+matplotlib==3.8.4
 osqp
 cvxpy
 pillow
-gradio
+pandas==2.2.3
+gradio==4.44.1
+huggingface_hub==0.25.2
+gradio_client==1.3.0

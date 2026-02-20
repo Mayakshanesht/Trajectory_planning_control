@@ -19,7 +19,7 @@ def main():
         print("=" * 50)
         print("Choose application:")
         print("1. Command Line Interface")
-        print("2. Enhanced Web Interface (4-Point Cubic)")
+        print("2. Web Interface (Mouse-Click 4-Point Cubic + MPC)")
         print("3. Exit")
         print("=" * 50)
         
@@ -35,10 +35,9 @@ def main():
             subprocess.run([sys.executable, "main_simple.py", "--trajectory", "ref1"])
             
         elif choice == "2":
-            print("\n🌐 Starting Enhanced Web Interface...")
-            print("This opens the enhanced interface with perfect 4-point cubic trajectories!")
-            print("URL: http://localhost:8085")
-            print("Features: 4-point cubic polynomial + Real MPC simulation + GIF animation!")
+            print("\n🌐 Starting Web Interface...")
+            print("URL: http://localhost:7860 (default Gradio port)")
+            print("Features: Mouse-click 4-point cubic trajectory + MPC tracking + GIF output")
             subprocess.run([sys.executable, "web_interface.py"])
             
         elif choice == "3":
@@ -48,21 +47,14 @@ def main():
     elif args.interface == 'cli':
         print("\n🖥️  Starting Command Line Interface...")
         subprocess.run([sys.executable, "main_simple.py", "--trajectory", "ref1"])
-        
-    elif args.interface == 'enhanced':
-        print("\n❌ Enhanced Gradio MPC Simulator is no longer available.")
-        print("The enhanced interface has been integrated into the web interface.")
-        print("Please use option 2 for the web interface instead.")
-        print("URL: http://localhost:8085")
-        return
-        
-    elif args.interface == 'main':
-        print("\n🚀 Starting Main MPC Simulation...")
-        subprocess.run([sys.executable, "main.py"])
+
+    elif args.interface == 'web':
+        print("\n🌐 Starting Web Interface...")
+        subprocess.run([sys.executable, "web_interface.py"])
     
     else:
         print(f"\n❌ Unknown interface: {args.interface}")
-        print("Available: menu, cli, enhanced, main")
+        print("Available: menu, cli, web")
 
 if __name__ == "__main__":
     main()

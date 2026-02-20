@@ -1,582 +1,528 @@
 """
-Gradio MPC Web Interface with Clickable Waypoints
-------------------------------------------------
-• Click to place exactly 4 waypoints (START → MID1 → MID2 → END)
-• Cubic polynomial trajectory
-• Real MPC tracking with track constraints
-• Animated GIF output
+Student-friendly Gradio UI for MPC trajectory tracking.
+
+Main workflow:
+1. Click exactly 4 points on the road image.
+2. Fit cubic polynomials x(t), y(t) through those points.
+3. Build reference states [x, y, psi, v, 0, 0].
+4. Run linearized MPC with road corridor constraints.
 """
 
-import os
 import numpy as np
 import matplotlib.pyplot as plt
 import gradio as gr
+import gradio_client.utils as gr_client_utils
+import os
+import csv
+import tempfile
 
-from config.params import *
-from track.track import sinusoidal_track, corridor_constraints
-from utils.trajectory_utils import direct_waypoint_interpolation
-from utils.plotting import create_trajectory_gif
-from track.reference_trajectories import (
-    zigzag_reference_trajectory,
-    s_curve_reference_trajectory,
-    sinusoidal_reference_trajectory_with_lane_changes
-)
-
-from vehicle.dynamics import step
-from vehicle.actuators import ActuatorModel
-from vehicle.sensors import measure
-from estimation.ekf import EKF
+from config.params import DT, VEHICLE, LIMITS, NOISE
 from control.linearize import linearize
 from control.mpc import MPC
+from estimation.ekf import EKF
+from track.track import sinusoidal_track, corridor_constraints
+from utils.plotting import create_trajectory_gif
+from vehicle.actuators import ActuatorModel
+from vehicle.dynamics import step
+from vehicle.sensors import measure
 
 
-# ---------------------------------------------------------
-# Track (global, fixed)
-# ---------------------------------------------------------
+TRACK_LENGTH = 60.0
+TRACK_AMPLITUDE = 5.0
+TRACK_WIDTH = 7.4
+TRACK_POINTS = 250
+
+X_MIN, X_MAX = 0.0, 60.0
+Y_MIN, Y_MAX = -8.0, 8.0
+IMG_W, IMG_H = 1200, 420
+
 CENTER, WIDTH = sinusoidal_track(
-    length=60.0,
-    amplitude=5.0,
-    width=7.4,
-    points=250
+    length=TRACK_LENGTH, amplitude=TRACK_AMPLITUDE, width=TRACK_WIDTH, points=TRACK_POINTS
 )
 
+HALF_WIDTH_MARGIN = WIDTH / 2.0 - 0.35
 
-# ---------------------------------------------------------
-# Plot track + waypoints
-# ---------------------------------------------------------
-def plot_track_with_waypoints(waypoints):
-    fig, ax = plt.subplots(figsize=(10, 4))
+MPC_EXPLANATION = """
+### MPC Optimization Used Here
+- Objective:
+  - State tracking: `sum_k (x_k - x_ref,k)^T Q (x_k - x_ref,k)`
+  - Control effort: `sum_k u_k^T R u_k`
+  - Input smoothness: `sum_k (u_{k+1} - u_k)^T Rj (u_{k+1} - u_k)`
+- System model constraint (linearized every step):
+  - `x_{k+1} = A_k x_k + B_k u_k + c_k`
+- Input constraints:
+  - `u_min <= u_k <= u_max`
+- Road corridor constraints:
+  - Half-space bounds on `(x_k, y_k)` from the local road normal
+- Solver:
+  - All terms are assembled into one QP and solved with OSQP in `control/mpc.py`.
+"""
 
-    # Centerline
-    ax.plot(CENTER[:, 0], CENTER[:, 1], "--", color="gray", linewidth=1)
 
-    # Road boundaries
+def _patch_gradio_schema_bool_bug():
+    """Work around gradio_client schema parsing on boolean additionalProperties."""
+    original = gr_client_utils._json_schema_to_python_type
+
+    def patched(schema, defs=None):
+        if isinstance(schema, bool):
+            return "Any" if schema else "None"
+        return original(schema, defs)
+
+    gr_client_utils._json_schema_to_python_type = patched
+
+
+_patch_gradio_schema_bool_bug()
+
+
+def _road_boundaries(center: np.ndarray, width: float) -> tuple[np.ndarray, np.ndarray]:
     left, right = [], []
-    for i in range(len(CENTER)):
-        if i < len(CENTER) - 1:
-            t = CENTER[i + 1] - CENTER[i]
-        else:
-            t = CENTER[i] - CENTER[i - 1]
-        t = t / np.linalg.norm(t)
-        n = np.array([-t[1], t[0]])
-        left.append(CENTER[i] + n * WIDTH / 2)
-        right.append(CENTER[i] - n * WIDTH / 2)
-
-    left, right = np.array(left), np.array(right)
-    ax.plot(left[:, 0], left[:, 1], color="black")
-    ax.plot(right[:, 0], right[:, 1], color="black")
-
-    # Waypoints
-    labels = ["START", "MID 1", "MID 2", "END"]
-    for i, (x, y) in enumerate(waypoints):
-        ax.scatter(x, y, s=80, color="red", zorder=5)
-        ax.text(x, y + 0.4, labels[i], ha="center", fontsize=9)
-
-    ax.set_xlim(0, 60)
-    ax.set_ylim(-8, 8)
-    ax.set_aspect("equal")
-    ax.set_title("Click on the road to place 4 waypoints")
-    ax.grid(True)
-
-    # Convert figure to numpy array for Gradio
-    fig.canvas.draw()
-    buf = fig.canvas.buffer_rgba()
-    img_array = np.asarray(buf)
-    img_array = img_array[:, :, :3]  # Remove alpha channel
-    plt.close(fig)
-    
-    return img_array
+    for i in range(len(center)):
+        tangent = center[min(i + 1, len(center) - 1)] - center[max(i - 1, 0)]
+        tangent = tangent / np.linalg.norm(tangent)
+        normal = np.array([-tangent[1], tangent[0]])
+        left.append(center[i] + normal * width / 2.0)
+        right.append(center[i] - normal * width / 2.0)
+    return np.asarray(left), np.asarray(right)
 
 
-# ---------------------------------------------------------
-# Click handler
-# ---------------------------------------------------------
-def add_waypoint(waypoints, x, y):
-    print(f"DEBUG: add_waypoint called with waypoints={waypoints}, x={x}, y={y}")
-    
-    if waypoints is None:
-        waypoints = []
-        print("DEBUG: waypoints was None, initialized to empty list")
-
-    print(f"DEBUG: current waypoints count: {len(waypoints)}")
-    
-    if len(waypoints) >= 4:
-        print("DEBUG: already have 4 waypoints, returning")
-        return plot_track_with_waypoints(waypoints), waypoints
-
-    print(f"DEBUG: adding waypoint: [{float(x)}, {float(y)}]")
-    waypoints.append([float(x), float(y)])
-    print(f"DEBUG: waypoints after adding: {waypoints}")
-    
-    try:
-        result = plot_track_with_waypoints(waypoints)
-        print("DEBUG: plot_track_with_waypoints succeeded")
-        return result, waypoints
-    except Exception as e:
-        print(f"DEBUG: plot_track_with_waypoints failed: {e}")
-        return plot_track_with_waypoints([]), waypoints
+def _center_normals(center: np.ndarray) -> np.ndarray:
+    normals = []
+    for i in range(len(center)):
+        tangent = center[min(i + 1, len(center) - 1)] - center[max(i - 1, 0)]
+        tangent = tangent / max(np.linalg.norm(tangent), 1e-8)
+        normals.append(np.array([-tangent[1], tangent[0]]))
+    return np.asarray(normals)
 
 
-def clear_waypoints():
-    return plot_track_with_waypoints([]), []
+NORMALS = _center_normals(CENTER)
 
 
-# ---------------------------------------------------------
-# Reference trajectory from waypoints
-# ---------------------------------------------------------
-def build_reference(waypoints, speed):
-    traj = direct_waypoint_interpolation(waypoints, N=120)
-    traj = np.array(traj)
+def _smoothstep(a: float, b: float, x: np.ndarray) -> np.ndarray:
+    t = np.clip((x - a) / max(b - a, 1e-8), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
 
-    dx = np.gradient(traj[:, 0])
-    dy = np.gradient(traj[:, 1])
+
+def _forward_nearest_index(path_xy: np.ndarray, p_xy: np.ndarray, last_idx: int, window: int = 40) -> int:
+    lo = max(0, last_idx)
+    hi = min(len(path_xy), lo + window)
+    local = path_xy[lo:hi]
+    if len(local) == 0:
+        return min(last_idx, len(path_xy) - 1)
+    return int(lo + np.argmin(np.linalg.norm(local - p_xy, axis=1)))
+
+
+def _resample_polyline(points: np.ndarray, samples: int = 180) -> np.ndarray:
+    if len(points) < 2:
+        raise ValueError("Need at least 2 points to build a trajectory.")
+    seg = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    s = np.hstack(([0.0], np.cumsum(seg)))
+    total = s[-1]
+    if total < 1e-6:
+        raise ValueError("Reference points are degenerate (zero-length path).")
+    s_target = np.linspace(0.0, total, samples)
+    x = np.interp(s_target, s, points[:, 0])
+    y = np.interp(s_target, s, points[:, 1])
+    return np.column_stack([x, y])
+
+
+def _reference_from_xy(path_xy: np.ndarray, base_speed: float) -> np.ndarray:
+    path_xy = _resample_polyline(path_xy, samples=200)
+    dx = np.gradient(path_xy[:, 0])
+    dy = np.gradient(path_xy[:, 1])
     psi = np.unwrap(np.arctan2(dy, dx))
+    ds = np.maximum(np.sqrt(dx * dx + dy * dy), 1e-5)
+    kappa = np.abs(np.gradient(psi) / ds)
+    speed_scale = np.clip(1.0 / (1.0 + 6.0 * kappa), 0.45, 1.0)
+    v_ref = np.clip(base_speed * speed_scale, 1.0, base_speed)
 
-    ref = np.zeros((len(traj), 6))
-    ref[:, 0] = traj[:, 0]
-    ref[:, 1] = traj[:, 1]
+    ref = np.zeros((len(path_xy), 6))
+    ref[:, 0] = path_xy[:, 0]
+    ref[:, 1] = path_xy[:, 1]
     ref[:, 2] = psi
-    ref[:, 3] = speed
-
+    ref[:, 3] = v_ref
     return ref
 
 
-# ---------------------------------------------------------
-# MPC simulation (correct + stable)
-# ---------------------------------------------------------
-def run_mpc_simulation(waypoints, speed, horizon):
+def _build_offset_path(offsets: np.ndarray) -> np.ndarray:
+    clamped = np.clip(offsets, -HALF_WIDTH_MARGIN, HALF_WIDTH_MARGIN)
+    return CENTER + NORMALS * clamped[:, None]
 
-    ref_traj = build_reference(waypoints, speed)
 
-    x = np.array([
-        waypoints[0][0],
-        waypoints[0][1],
-        ref_traj[0, 2],
-        speed,
-        0.0,
-        0.0
-    ])
+def _trajectory_offsets(traj_type: str) -> np.ndarray:
+    s = np.linspace(0.0, 1.0, len(CENTER))
+    if traj_type == "ref1":
+        left = -WIDTH * 0.22
+        right = WIDTH * 0.22
+        lane = left + (right - left) * _smoothstep(0.20, 0.42, s)
+        lane = lane + (left - right) * _smoothstep(0.58, 0.82, s)
+        return lane
+    if traj_type == "ref2":
+        return (WIDTH * 0.24) * np.sin(3.2 * np.pi * s)
+    if traj_type == "ref3":
+        return (WIDTH * 0.2) * np.sin(2.0 * np.pi * s) * (0.8 + 0.2 * np.cos(2.0 * np.pi * s))
+    raise ValueError(f"Unknown trajectory type: {traj_type}")
+
+
+def render_track_image(waypoints: list[list[float]] | None) -> np.ndarray:
+    waypoints = waypoints or []
+    left, right = _road_boundaries(CENTER, WIDTH)
+
+    fig = plt.figure(figsize=(IMG_W / 100, IMG_H / 100), dpi=100)
+    ax = fig.add_axes([0.0, 0.0, 1.0, 1.0])
+
+    ax.fill_between(left[:, 0], left[:, 1], right[:, 1], color="#d6d6d6", alpha=0.65)
+    ax.plot(CENTER[:, 0], CENTER[:, 1], "--", color="#5f5f5f", linewidth=1.0)
+    ax.plot(left[:, 0], left[:, 1], color="black", linewidth=1.7)
+    ax.plot(right[:, 0], right[:, 1], color="black", linewidth=1.7)
+
+    labels = ["START", "MID-1", "MID-2", "END"]
+    for idx, (x, y) in enumerate(waypoints):
+        ax.scatter(x, y, c="#d62728", s=120, zorder=5, edgecolors="white", linewidths=1.2)
+        ax.text(x + 0.35, y + 0.25, labels[idx], fontsize=9, weight="bold", color="#222222")
+
+    ax.set_xlim(X_MIN, X_MAX)
+    ax.set_ylim(Y_MIN, Y_MAX)
+    ax.set_aspect("equal")
+    ax.axis("off")
+
+    fig.canvas.draw()
+    frame = np.asarray(fig.canvas.buffer_rgba())[:, :, :3]
+    plt.close(fig)
+    return frame
+
+
+def _is_on_road(x: float, y: float) -> bool:
+    nearest = int(np.argmin(np.linalg.norm(CENTER - np.array([x, y]), axis=1)))
+    dist = float(np.linalg.norm(CENTER[nearest] - np.array([x, y])))
+    return dist <= (WIDTH / 2.0)
+
+
+def _build_mpc(horizon: int) -> MPC:
+    q_weights = [120, 120, 30, 15, 10, 10]
+    r_weights = [12.0, 5.0]
+    rj_weights = [60.0, 20.0]
+    return MPC(
+        horizon,
+        q_weights,
+        r_weights,
+        rj_weights,
+        [-LIMITS["steer_max"], -LIMITS["accel_max"]],
+        [LIMITS["steer_max"], LIMITS["accel_max"]],
+    )
+
+
+def _run_mpc_on_reference(ref_traj: np.ndarray, horizon: int):
+    x = np.array([ref_traj[0, 0], ref_traj[0, 1], ref_traj[0, 2], ref_traj[0, 3], 0.0, 0.0])
     u_prev = np.zeros(2)
 
-    act = ActuatorModel(
-        LIMITS["steer_rate"],
-        LIMITS["steer_max"],
-        LIMITS["accel_max"]
-    )
+    actuator = ActuatorModel(LIMITS["steer_rate"], LIMITS["steer_max"], LIMITS["accel_max"])
     ekf = EKF(DT, VEHICLE)
+    mpc = _build_mpc(horizon)
 
-    Q = [120, 120, 30, 15, 10, 10]
-    R = [12.0, 5.0]
-    Rj = [60.0, 20.0]
-
-    mpc = MPC(
-        horizon,
-        Q, R, Rj,
-        [-LIMITS["steer_max"], -LIMITS["accel_max"]],
-        [ LIMITS["steer_max"],  LIMITS["accel_max"]]
-    )
-
-    states = []
-    errors = []
+    states, errors = [x.copy()], []
     last_ref_idx = 0
+    stall_steps = 0
 
-    # Continue simulation until we reach the end of the reference trajectory
-    while True:
-        dists = np.linalg.norm(ref_traj[:, :2] - x[:2], axis=1)
-        idx = max(np.argmin(dists), last_ref_idx)
+    max_steps = int(len(ref_traj) * 2.4)
+    for _ in range(max_steps):
+        idx = _forward_nearest_index(ref_traj[:, :2], x[:2], last_ref_idx, window=45)
+        if idx <= last_ref_idx:
+            stall_steps += 1
+        else:
+            stall_steps = 0
+        idx = max(idx, last_ref_idx)
         last_ref_idx = idx
 
-        # Break if we've reached the end of the reference trajectory
         if idx >= len(ref_traj) - horizon - 1:
-            print(f"DEBUG: Reached end of reference trajectory at idx {idx}")
             break
-            
-        ref = ref_traj[idx:idx + horizon]
+        if stall_steps > 45:
+            break
 
+        ref = ref_traj[idx : idx + horizon].copy()
         z = measure(x, NOISE)
         ekf.predict(u_prev)
         xhat = ekf.update(z)
 
-        A, B, c, track_cons = [], [], [], []
+        A_list, B_list, c_list, track_cons = [], [], [], []
         for k in range(horizon):
-            a, b, cc = linearize(ref[k], u_prev, DT, VEHICLE)
-            A.append(a)
-            B.append(b)
-            c.append(cc)
+            A_k, B_k, c_k = linearize(ref[k], u_prev, DT, VEHICLE)
+            A_list.append(A_k)
+            B_list.append(B_k)
+            c_list.append(c_k)
+            center_idx = int(np.argmin(np.linalg.norm(CENTER - ref[k, :2], axis=1)))
+            center_idx = min(center_idx, len(CENTER) - 2)
+            track_cons.append(corridor_constraints(CENTER, WIDTH, center_idx))
 
-            ci = min(idx + k, len(CENTER) - 1)
-            track_cons.append(corridor_constraints(CENTER, WIDTH, ci))
-
-        u = mpc.solve(xhat, ref, A, B, c, track_cons, [])
-        u = u[:2]  # Take only the first control input (steering, acceleration)
-        u = act.apply(u, DT)
-
+        u_sequence = mpc.solve(xhat, ref, A_list, B_list, c_list, track_cons, [])
+        u = actuator.apply(u_sequence[:2], DT)
         x = step(x, u, DT, VEHICLE)
         u_prev = u
 
         states.append(x.copy())
         errors.append(np.linalg.norm(x[:2] - ref[0, :2]))
 
-    states = np.array(states)
+    states = np.asarray(states, dtype=float)
+    if len(states) < 2:
+        return None, None
 
-    # Use the actual reference point the vehicle was following at the end
-    # This is more accurate than just taking the last point of the generated trajectory
-    final_ref_idx = last_ref_idx  # This is the index of the reference point we were actually following
-    actual_endpoint = ref_traj[final_ref_idx, :2]  # Use the reference point we were actually following
-    
-    print(f"DEBUG: Manual waypoints - Final ref idx: {final_ref_idx}")
-    print(f"DEBUG: Manual waypoints - Using actual ref point: {actual_endpoint}")
-    print(f"DEBUG: Manual waypoints - Last manual waypoint was: {waypoints[-1]}")
-    print(f"DEBUG: Manual waypoints - Generated trajectory endpoint: {ref_traj[-1, :2]}")
+    ref_indices = np.linspace(0, len(ref_traj) - 1, len(states)).astype(int)
+    ref_interp = ref_traj[ref_indices]
 
-    metrics = {
-        "final_error": float(np.linalg.norm(states[-1, :2] - actual_endpoint)),
-        "avg_error": float(np.mean(errors)),
-        "max_error": float(np.max(errors)),
+    final_target = ref_traj[last_ref_idx, :2]
+    return {
+        "final_error": float(np.linalg.norm(states[-1, :2] - final_target)),
+        "avg_error": float(np.mean(errors)) if errors else 0.0,
+        "max_error": float(np.max(errors)) if errors else 0.0,
         "path_length": float(np.sum(np.linalg.norm(np.diff(states[:, :2], axis=0), axis=1))),
-        "steps": len(states),
+        "steps": int(len(states)),
+        "progress": float(last_ref_idx / max(1, len(ref_traj) - 1)),
+        "states": states,
+        "ref_interp": ref_interp,
     }
 
-    gif_path = "mpc_gradio.gif"
-    
-    # Interpolate the reference trajectory to match the actual trajectory length
-    if len(states) > 1 and len(ref_traj) > 1:
-        # Create interpolation indices for the reference trajectory
-        ref_indices = np.linspace(0, len(ref_traj) - 1, len(states))
-        ref_indices = np.clip(ref_indices, 0, len(ref_traj) - 1).astype(int)
-        
-        # Interpolate the reference trajectory
-        ref_interp = ref_traj[ref_indices]
-        
-        print(f"DEBUG: Interpolated reference trajectory from {len(ref_traj)} to {len(states)} points")
-    else:
-        ref_interp = ref_traj[:len(states)] if len(states) <= len(ref_traj) else ref_traj
-    
-    create_trajectory_gif(
-        states,
-        ref_interp,
-        CENTER,
-        WIDTH,
-        [],
-        save_path=gif_path,
-        fps=20
-    )
 
-    return metrics, gif_path
-
-
-def test_ref_trajectory(traj_type, speed, horizon):
-    """Simple test function to verify button clicks work"""
-    print(f"TEST: Reference trajectory button clicked!")
-    print(f"TEST: traj_type={traj_type}, speed={speed}, horizon={horizon}")
-    
-    # Create a simple test without MPC
-    try:
-        center, width = sinusoidal_track(length=60.0, amplitude=5.0, width=7.4, points=250)
-        
-        report = f"""
-✅ SIMPLE TEST SUCCESSFUL
-
-• Trajectory Type: {traj_type}
-• Speed: {speed} m/s
-• Horizon: {horizon} steps
-• Track Length: {len(center)} points
-• Track Width: {width} m
-• Status: Basic functionality working!
-
-This is a simple test without MPC simulation.
-"""
-        
-        return report, None
-        
-    except Exception as e:
-        error_report = f"❌ Simple test failed: {str(e)}"
-        return error_report, None
+def _format_metrics(title: str, metrics: dict, extra_lines: list[str] | None = None) -> str:
+    lines = [
+        f"{title}",
+        "",
+        f"- Final error: {metrics['final_error']:.2f} m",
+        f"- Average error: {metrics['avg_error']:.2f} m",
+        f"- Max error: {metrics['max_error']:.2f} m",
+        f"- Path length: {metrics['path_length']:.2f} m",
+        f"- Simulation steps: {metrics['steps']}",
+        f"- Completed progress: {metrics['progress'] * 100:.1f}%",
+    ]
+    if extra_lines:
+        lines.extend(extra_lines)
+    return "\n".join(lines)
 
 
 def run_reference_trajectory(traj_type, speed, horizon):
-    """Run MPC simulation with reference trajectory"""
-    print(f"DEBUG: run_reference_trajectory called with traj_type={traj_type}, speed={speed}, horizon={horizon}")
-    
+    offset_profile = _trajectory_offsets(traj_type)
+    path = _build_offset_path(offset_profile)
+    ref_traj = _reference_from_xy(path, speed)
+    metrics = _run_mpc_on_reference(ref_traj, horizon)
+    if metrics is None:
+        return "MPC did not produce enough simulation steps. Try a larger horizon.", None
+
+    gif_path = f"mpc_{traj_type}_tracking.gif"
+    create_trajectory_gif(metrics["states"], metrics["ref_interp"], CENTER, WIDTH, [], save_path=gif_path, fps=20)
+
+    report = _format_metrics(
+        f"Reference Trajectory `{traj_type}` Results",
+        metrics,
+        [
+            f"- Horizon: {horizon}",
+            f"- Peak reference speed: {speed:.2f} m/s",
+            "- Reference uses smooth lateral offset profile + curvature-aware speed scaling.",
+        ],
+    )
+    return report, gif_path
+
+
+def _guidance_text() -> str:
+    return (
+        "Reference input guide:\n"
+        "1) Use either columns x,y (meters) OR s,offset.\n"
+        "2) s is normalized path position in [0, 1].\n"
+        f"3) offset must stay within +/-{HALF_WIDTH_MARGIN:.2f} m.\n"
+        "4) Provide at least 4 points; points should move forward along the road."
+    )
+
+
+def _create_reference_template() -> str:
+    fd, path = tempfile.mkstemp(prefix="trajectory_template_", suffix=".csv")
+    os.close(fd)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["s", "offset"])
+        writer.writerow([0.00, 0.00])
+        writer.writerow([0.25, 1.20])
+        writer.writerow([0.50, -1.20])
+        writer.writerow([0.75, 1.00])
+        writer.writerow([1.00, 0.00])
+    return path
+
+
+def _center_point_from_s_offset(s: float, offset: float) -> np.ndarray:
+    s = float(np.clip(s, 0.0, 1.0))
+    idx = min(int(round(s * (len(CENTER) - 1))), len(CENTER) - 1)
+    offset = float(np.clip(offset, -HALF_WIDTH_MARGIN, HALF_WIDTH_MARGIN))
+    return CENTER[idx] + NORMALS[idx] * offset
+
+
+def _load_points_from_file(file_obj):
+    if file_obj is None:
+        raise ValueError("Upload a CSV/XLSX file first.")
+    path = getattr(file_obj, "name", str(file_obj))
+    ext = os.path.splitext(path)[1].lower()
+
+    rows = []
+    if ext == ".csv":
+        with open(path, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                rows.append({k.strip().lower(): (v.strip() if isinstance(v, str) else v) for k, v in row.items()})
+    elif ext in (".xlsx", ".xls"):
+        try:
+            import pandas as pd  # Lazy import: only needed for Excel files
+        except Exception as exc:
+            raise ValueError(f"Excel parsing requires pandas/openpyxl in this env. ({exc})") from exc
+        df = pd.read_excel(path)
+        cols = {str(c).strip().lower(): c for c in df.columns}
+        rows = []
+        for _, r in df.iterrows():
+            rows.append({k: r[v] for k, v in cols.items()})
+    else:
+        raise ValueError("Unsupported file type. Use .csv or .xlsx")
+
+    if not rows:
+        raise ValueError("No rows found in uploaded file.")
+
+    keys = set(rows[0].keys())
+    points = []
+    if {"x", "y"}.issubset(keys):
+        for row in rows:
+            x = float(row["x"])
+            y = float(row["y"])
+            points.append([x, y])
+    elif {"s", "offset"}.issubset(keys):
+        for row in rows:
+            s = float(row["s"])
+            offset = float(row["offset"])
+            points.append(_center_point_from_s_offset(s, offset).tolist())
+    else:
+        raise ValueError("Expected columns x,y or s,offset.")
+
+    points = np.asarray(points, dtype=float)
+    if len(points) < 4:
+        raise ValueError("At least 4 points are required.")
+
+    idxs = [int(np.argmin(np.linalg.norm(CENTER - p, axis=1))) for p in points]
+    if any(b < a for a, b in zip(idxs, idxs[1:])):
+        raise ValueError("Points must move forward along the road (monotonic progress).")
+
+    for p in points:
+        if not _is_on_road(float(p[0]), float(p[1])):
+            raise ValueError("One or more points are outside road bounds.")
+    return points
+
+
+def run_uploaded_reference_mpc(file_obj, speed, horizon):
     try:
-        # Create track
-        print("DEBUG: Creating track...")
-        center, width = sinusoidal_track(length=60.0, amplitude=5.0, width=7.4, points=250)
-        print(f"DEBUG: Track created with {len(center)} points")
-        
-        # Initialize vehicle
-        print("DEBUG: Initializing vehicle...")
-        start_position = center[0].copy()
-        start_heading = 0.0
-        x = np.array([start_position[0], start_position[1], start_heading, speed, 0.0, 0.0])
-        u_prev = np.zeros(2)
-        print(f"DEBUG: Vehicle initialized at position {start_position}")
-        
-        # Initialize components
-        print("DEBUG: Initializing MPC components...")
-        act = ActuatorModel(LIMITS["steer_rate"], LIMITS["steer_max"], LIMITS["accel_max"])
-        ekf = EKF(DT, VEHICLE)
-        
-        # MPC weights
-        Q_TRACK_SAFE = [120, 120, 30, 15, 10, 10]
-        R_INPUT_SAFE = [12.0, 5.0]
-        R_JERK_SAFE = [60.0, 20.0]
-        
-        mpc = MPC(horizon, Q_TRACK_SAFE, R_INPUT_SAFE, R_JERK_SAFE,
-                  [-LIMITS["steer_max"], -LIMITS["accel_max"]],
-                  [ LIMITS["steer_max"],  LIMITS["accel_max"]])
-        print("DEBUG: MPC components initialized")
-        
-        # Run simulation
-        print("DEBUG: Starting simulation loop...")
-        states = [x.copy()]
-        errors = []
-        final_ref_point = center[-1].copy()  # Initialize with default endpoint
-        
-        for step_idx in range(200):  # Run for 200 steps
-            if step_idx % 50 == 0:
-                print(f"DEBUG: Step {step_idx}/200")
-            
-            # Generate reference trajectory based on type
-            current_progress_idx = int(step_idx * len(center) / 200)
-            current_progress = current_progress_idx / len(center)
-            
-            print(f"DEBUG: Generating {traj_type} trajectory at progress {current_progress:.2f}")
-            
-            if traj_type == "ref1":
-                # Sinusoidal with lane changes - use the same logic as main_simple.py
-                lane_width = width / 2
-                left_lane_offset = -lane_width / 2
-                right_lane_offset = lane_width / 2
-                
-                # Simple lane change logic
-                if current_progress < 0.3:
-                    current_target_offset = left_lane_offset
-                elif current_progress < 0.7:
-                    current_target_offset = right_lane_offset
-                else:
-                    current_target_offset = left_lane_offset
-                
-                print(f"DEBUG: Using lane offset: {current_target_offset}")
-                
-                ref = sinusoidal_reference_trajectory_with_lane_changes(
-                    x, center, horizon, DT, speed=speed,
-                    target_lane_offset=current_target_offset, lane_width=lane_width,
-                    current_idx=current_progress_idx
-                )
-                print(f"DEBUG: Generated ref trajectory with shape: {ref.shape}")
-                
-                # Calculate proper endpoint based on final lane position
-                if current_progress >= 0.7:
-                    final_ref_point = np.array([center[-1, 0], center[-1, 1] + left_lane_offset])
-                else:
-                    final_ref_point = np.array([center[-1, 0], center[-1, 1] + right_lane_offset])
-                    
-            elif traj_type == "ref2":
-                # Zigzag pattern
-                print("DEBUG: Generating zigzag trajectory...")
-                ref = zigzag_reference_trajectory(
-                    x, center, horizon, DT, speed=speed,
-                    amplitude_offset=2.0, current_idx=current_progress_idx
-                )
-                print(f"DEBUG: Generated ref trajectory with shape: {ref.shape}")
-                # For zigzag, the final position should be near the track center
-                final_ref_point = center[-1].copy()
-                
-            elif traj_type == "ref3":
-                # S-curve pattern
-                print("DEBUG: Generating S-curve trajectory...")
-                ref = s_curve_reference_trajectory(
-                    x, center, horizon, DT, speed=speed,
-                    current_idx=current_progress_idx
-                )
-                print(f"DEBUG: Generated ref trajectory with shape: {ref.shape}")
-                # For S-curve, the final position should be near the track center
-                final_ref_point = center[-1].copy()
-                
-            else:
-                print(f"DEBUG: Unknown trajectory type: {traj_type}")
-                return f"❌ Unknown trajectory type: {traj_type}", None
-            
-            print(f"DEBUG: Building MPC matrices for step {step_idx}")
-            # Build MPC matrices
-            A, B, c = [], [], []
-            track_cons = []
-            
-            for k in range(horizon):
-                a, b, cc = linearize(ref[k], u_prev, DT, VEHICLE)
-                A.append(a); B.append(b); c.append(cc)
-                
-                ci = min(current_progress_idx + k, len(center) - 1)
-                track_cons.append(corridor_constraints(center, width, ci))
-            
-            print(f"DEBUG: Solving MPC for step {step_idx}")
-            # Solve MPC
-            u = mpc.solve(x, ref, A, B, c, track_cons, [])
-            u = u[:2]  # Take only first control input
-            u = act.apply(u, DT)
-            
-            # Update vehicle
-            x = step(x, u, DT, VEHICLE)
-            u_prev = u
-            
-            states.append(x.copy())
-            errors.append(np.linalg.norm(x[:2] - ref[0, :2]))
-        
-        print("DEBUG: Simulation completed, calculating metrics...")
-        
-        # Calculate metrics - final_ref_point was calculated in the loop
-        states = np.array(states)
-        
-        print(f"DEBUG: Using trajectory endpoint: {final_ref_point}")
-        
-        metrics = {
-            "final_error": float(np.linalg.norm(states[-1, :2] - final_ref_point)),
-            "avg_error": float(np.mean(errors)),
-            "max_error": float(np.max(errors)),
-            "path_length": float(np.sum(np.linalg.norm(np.diff(states[:, :2], axis=0), axis=1))),
-            "steps": len(states),
-        }
-        
-        print("DEBUG: Creating GIF...")
-        # Create GIF
-        gif_path = create_trajectory_gif(states, [], [], save_path=f'mpc_{traj_type}_tracking.gif')
-        
-        report = f"""
-📊 {traj_type.upper()} MPC RESULTS
+        points = _load_points_from_file(file_obj)
+    except Exception as exc:
+        return f"Upload validation failed: {exc}\n\n{_guidance_text()}", None
 
-• Final error: {metrics['final_error']:.2f} m
-• Average error: {metrics['avg_error']:.2f} m
-• Max error: {metrics['max_error']:.2f} m
-• Path length: {metrics['path_length']:.2f} m
-• Simulation steps: {metrics['steps']}
-• Trajectory type: {traj_type}
-• Final position: ({states[-1, 0]:.2f}, {states[-1, 1]:.2f}) m
-• Target position: ({final_ref_point[0]:.2f}, {final_ref_point[1]:.2f}) m
-"""
-        
-        print(f"DEBUG: {traj_type} simulation completed successfully")
-        return report, gif_path
-        
-    except Exception as e:
-        print(f"DEBUG: Error in {traj_type} trajectory: {e}")
-        import traceback
-        traceback.print_exc()
-        error_report = f"❌ Error running {traj_type} trajectory: {str(e)}"
-        return error_report, None
+    ref_traj = _reference_from_xy(points, speed)
+    metrics = _run_mpc_on_reference(ref_traj, horizon)
+    if metrics is None:
+        return "MPC failed to run on uploaded reference. Try a smoother file.", None
+
+    gif_path = "mpc_uploaded_reference.gif"
+    create_trajectory_gif(metrics["states"], metrics["ref_interp"], CENTER, WIDTH, [], save_path=gif_path, fps=20)
+    report = _format_metrics(
+        "Uploaded-Reference MPC Results",
+        metrics,
+        [
+            f"- Input points: {len(points)}",
+            "- Accepted formats: x,y or s,offset.",
+            _guidance_text(),
+        ],
+    )
+    return report, gif_path
 
 
-# ---------------------------------------------------------
-# Reference trajectory callback
-# ---------------------------------------------------------
-def run_from_ui(waypoints, speed, horizon):
+def run_anchor_offset_mpc(start_off, peak_pos_off, peak_neg_off, end_off, speed, horizon):
+    anchor_idx = [0, int(np.argmax(CENTER[:, 1])), int(np.argmin(CENTER[:, 1])), len(CENTER) - 1]
+    s_anchor = np.asarray(anchor_idx, dtype=float) / float(len(CENTER) - 1)
+    offsets = np.asarray([start_off, peak_pos_off, peak_neg_off, end_off], dtype=float)
+    offsets = np.clip(offsets, -HALF_WIDTH_MARGIN, HALF_WIDTH_MARGIN)
+    coeff = np.polyfit(s_anchor, offsets, 3)
+    s_full = np.linspace(0.0, 1.0, len(CENTER))
+    curve_offsets = np.polyval(coeff, s_full)
+    path = _build_offset_path(curve_offsets)
+    ref_traj = _reference_from_xy(path, speed)
 
-    if waypoints is None or len(waypoints) != 4:
-        return "❌ Please click exactly 4 waypoints.", None
+    metrics = _run_mpc_on_reference(ref_traj, horizon)
+    if metrics is None:
+        return "MPC failed to run for anchor offsets. Reduce lateral offsets.", None
 
-    metrics, gif = run_mpc_simulation(waypoints, speed, horizon)
-    
-    # Get the reference trajectory for reporting
-    ref_traj = build_reference(waypoints, speed)
-    
-    report = f"""
-📊 MANUAL WAYPOINTS MPC RESULTS
-
-• Final error: {metrics['final_error']:.2f} m
-• Average error: {metrics['avg_error']:.2f} m
-• Max error: {metrics['max_error']:.2f} m
-• Path length: {metrics['path_length']:.2f} m
-• Simulation steps: {metrics['steps']}
-• Waypoints used: {[f"P{i+1}({w[0]:.1f},{w[1]:.1f})" for i,w in enumerate(waypoints)]}
-• Generated trajectory points: {len(ref_traj)}
-• Status: Following smooth cubic polynomial through waypoints
-"""
-
-    return report, gif
+    gif_path = "mpc_anchor_offsets.gif"
+    create_trajectory_gif(metrics["states"], metrics["ref_interp"], CENTER, WIDTH, [], save_path=gif_path, fps=20)
+    report = _format_metrics(
+        "Anchor-Offset MPC Results",
+        metrics,
+        [
+            f"- Start offset: {offsets[0]:.2f} m",
+            f"- First peak offset: {offsets[1]:.2f} m",
+            f"- Negative peak offset: {offsets[2]:.2f} m",
+            f"- End offset: {offsets[3]:.2f} m",
+            f"- Offset limits enforced: +/-{HALF_WIDTH_MARGIN:.2f} m",
+        ],
+    )
+    return report, gif_path
 
 
-# ---------------------------------------------------------
-# Gradio UI
-# ---------------------------------------------------------
-demo = gr.Blocks(title="MPC Trajectory Tracking")
-
+demo = gr.Blocks(title="MPC Trajectory Tracking for Students")
 with demo:
+    gr.Markdown("## MPC Trajectory Tracking: Student Lab")
+    gr.Markdown(
+        "Use structured workflows: upload CSV/XLSX reference points, set guided anchor offsets, or run predefined references."
+    )
+    gr.Markdown("Set MPC parameters once, then use any input tab.")
+    with gr.Row():
+        speed = gr.Slider(1.0, 10.0, value=4.0, step=0.1, label="Reference speed (m/s)")
+        horizon = gr.Slider(15, 60, value=25, step=5, label="MPC horizon")
+    with gr.Accordion("MPC Formulation", open=False):
+        gr.Markdown(MPC_EXPLANATION)
 
-    gr.Markdown("## 🚗 MPC Trajectory Tracking with Manual Waypoint Entry")
-    gr.Markdown("Choose between **manual waypoints** or **reference trajectories**")
-    
-    with gr.Tabs():
-        with gr.TabItem("Manual Waypoints"):
-            gr.Markdown("Enter **exactly 4 waypoints** manually: START → MID1 → MID2 → END")
-            gr.Markdown("Format: x,y (e.g., 5.0,1.2). Valid range: x=[0,60], y=[-8,8]")
+    with gr.Tab("Predefined References"):
+        gr.Markdown("Run a predefined trajectory with smooth offset profiles and curvature-aware speed.")
+        traj_type = gr.Dropdown(
+            choices=[
+                ("Sinusoidal + Lane Changes", "ref1"),
+                ("Zigzag Pattern", "ref2"),
+                ("S-Curve Pattern", "ref3"),
+            ],
+            value="ref1",
+            label="Reference type",
+        )
+        run_reference_btn = gr.Button("Run MPC (Reference)")
 
-            waypoint_state = gr.State([])
+    with gr.Tab("Upload Reference"):
+        gr.Markdown(
+            "Upload a reference file with columns `x,y` or `s,offset`. "
+            "Use `s` in [0,1] and keep `offset` within lane limits."
+        )
+        template_btn = gr.Button("Generate CSV Template")
+        template_file = gr.File(label="Template download", interactive=False)
+        ref_file = gr.File(label="Upload CSV/XLSX reference", file_types=[".csv", ".xlsx", ".xls"])
+        run_upload_btn = gr.Button("Run MPC (Uploaded Reference)")
 
-            with gr.Row():
-                x_input = gr.Number(label="X coordinate", minimum=0, maximum=60, value=10)
-                y_input = gr.Number(label="Y coordinate", minimum=-8, maximum=8, value=0)
-                add_btn = gr.Button("Add Waypoint")
+    with gr.Tab("Guided Anchor Offsets"):
+        gr.Markdown(
+            "Set lateral offsets at fixed road anchor locations: START, first +peak, first -peak, END. "
+            "A cubic offset profile is fit through these anchors."
+        )
+        start_off = gr.Slider(-HALF_WIDTH_MARGIN, HALF_WIDTH_MARGIN, value=0.0, step=0.05, label="START offset (m)")
+        peak_pos_off = gr.Slider(-HALF_WIDTH_MARGIN, HALF_WIDTH_MARGIN, value=1.0, step=0.05, label="First +peak offset (m)")
+        peak_neg_off = gr.Slider(-HALF_WIDTH_MARGIN, HALF_WIDTH_MARGIN, value=-1.0, step=0.05, label="First -peak offset (m)")
+        end_off = gr.Slider(-HALF_WIDTH_MARGIN, HALF_WIDTH_MARGIN, value=0.0, step=0.05, label="END offset (m)")
+        run_anchor_btn = gr.Button("Run MPC (Anchor Offsets)")
 
-            track_plot = gr.Image(
-                value=plot_track_with_waypoints([]),
-                label="Track Visualization"
-            )
-
-            add_btn.click(
-                add_waypoint,
-                inputs=[waypoint_state, x_input, y_input],
-                outputs=[track_plot, waypoint_state]
-            )
-
-            with gr.Row():
-                clear_btn = gr.Button("Clear Waypoints")
-                run_btn = gr.Button("Run MPC")
-
-        with gr.TabItem("Reference Trajectories"):
-            gr.Markdown("Choose from predefined reference trajectories")
-            
-            traj_type = gr.Dropdown(
-                choices=[
-                    ("Sinusoidal with Lane Changes", "ref1"),
-                    ("Zigzag Pattern", "ref2"), 
-                    ("S-Curve Pattern", "ref3")
-                ],
-                value="ref1",
-                label="Reference Trajectory Type"
-            )
-            
-            ref_run_btn = gr.Button("Run Reference Trajectory")
-            ref_track_plot = gr.Image(
-                value=plot_track_with_waypoints([]),
-                label="Reference Track Visualization"
-            )
-
-    speed = gr.Slider(1, 10, value=4.0, step=0.1, label="Reference speed (m/s)")
-    horizon = gr.Slider(15, 60, value=25, step=5, label="MPC horizon")
-
-    output_text = gr.Textbox(lines=10, label="Results")
+    output_text = gr.Textbox(lines=14, label="Results")
     output_gif = gr.Image(type="filepath", label="MPC Animation")
 
-    ref_run_btn.click(
-        run_reference_trajectory,
-        inputs=[traj_type, speed, horizon],
-        outputs=[output_text, output_gif]
-    )
-
-    clear_btn.click(
-        clear_waypoints,
-        outputs=[track_plot, waypoint_state]
-    )
-
-    run_btn.click(
-        run_from_ui,
-        inputs=[waypoint_state, speed, horizon],
-        outputs=[output_text, output_gif]
+    run_reference_btn.click(run_reference_trajectory, inputs=[traj_type, speed, horizon], outputs=[output_text, output_gif])
+    template_btn.click(_create_reference_template, outputs=[template_file])
+    run_upload_btn.click(run_uploaded_reference_mpc, inputs=[ref_file, speed, horizon], outputs=[output_text, output_gif])
+    run_anchor_btn.click(
+        run_anchor_offset_mpc,
+        inputs=[start_off, peak_pos_off, peak_neg_off, end_off, speed, horizon],
+        outputs=[output_text, output_gif],
     )
 
 
-# ---------------------------------------------------------
-# Launch
-# ---------------------------------------------------------
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(server_name="0.0.0.0", share=True)
