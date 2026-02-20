@@ -125,15 +125,59 @@ def _resample_polyline(points: np.ndarray, samples: int = 180) -> np.ndarray:
     return np.column_stack([x, y])
 
 
-def _reference_from_xy(path_xy: np.ndarray, base_speed: float) -> np.ndarray:
-    path_xy = _resample_polyline(path_xy, samples=200)
-    dx = np.gradient(path_xy[:, 0])
-    dy = np.gradient(path_xy[:, 1])
-    psi = np.unwrap(np.arctan2(dy, dx))
-    ds = np.maximum(np.sqrt(dx * dx + dy * dy), 1e-5)
-    kappa = np.abs(np.gradient(psi) / ds)
-    speed_scale = np.clip(1.0 / (1.0 + 6.0 * kappa), 0.45, 1.0)
-    v_ref = np.clip(base_speed * speed_scale, 1.0, base_speed)
+def _reference_from_xy(
+    path_xy: np.ndarray,
+    base_speed: float,
+    heading: np.ndarray | None = None,
+    t: np.ndarray | None = None,
+    v_profile: np.ndarray | None = None,
+) -> np.ndarray:
+    if heading is not None and t is not None:
+        heading = np.asarray(heading, dtype=float)
+        t = np.asarray(t, dtype=float)
+        if len(path_xy) != len(heading) or len(path_xy) != len(t):
+            raise ValueError("x,y,heading,t (and optional velocity) must have the same number of rows.")
+        if len(path_xy) < 4:
+            raise ValueError("At least 4 rows are required.")
+        if np.any(np.diff(t) <= 0):
+            raise ValueError("t must be strictly increasing.")
+        if v_profile is not None and len(v_profile) != len(path_xy):
+            raise ValueError("velocity profile length must match x,y rows.")
+
+        t0 = float(t[0])
+        t_rel = t - t0
+        duration = float(t_rel[-1])
+        samples = int(np.clip(np.ceil(duration / DT) + 1, 60, 320))
+        t_grid = np.linspace(0.0, duration, samples)
+
+        x = np.interp(t_grid, t_rel, path_xy[:, 0])
+        y = np.interp(t_grid, t_rel, path_xy[:, 1])
+        path_xy = np.column_stack([x, y])
+
+        if np.nanmax(np.abs(heading)) > 2.0 * np.pi + 0.2:
+            heading = np.deg2rad(heading)
+        psi = np.interp(t_grid, t_rel, np.unwrap(heading))
+
+        if v_profile is not None:
+            v_profile = np.asarray(v_profile, dtype=float)
+            if np.any(v_profile <= 0):
+                raise ValueError("velocity values must be positive.")
+            v_ref = np.interp(t_grid, t_rel, v_profile)
+            v_ref = np.clip(v_ref, 0.5, 15.0)
+        else:
+            xdot = np.gradient(x, t_grid)
+            ydot = np.gradient(y, t_grid)
+            v_from_t = np.sqrt(xdot * xdot + ydot * ydot)
+            v_ref = np.clip(v_from_t, 1.0, max(1.0, base_speed))
+    else:
+        path_xy = _resample_polyline(path_xy, samples=200)
+        dx = np.gradient(path_xy[:, 0])
+        dy = np.gradient(path_xy[:, 1])
+        psi = np.unwrap(np.arctan2(dy, dx))
+        ds = np.maximum(np.sqrt(dx * dx + dy * dy), 1e-5)
+        kappa = np.abs(np.gradient(psi) / ds)
+        speed_scale = np.clip(1.0 / (1.0 + 6.0 * kappa), 0.45, 1.0)
+        v_ref = np.clip(base_speed * speed_scale, 1.0, base_speed)
 
     ref = np.zeros((len(path_xy), 6))
     ref[:, 0] = path_xy[:, 0]
@@ -263,7 +307,7 @@ def _run_mpc_on_reference(ref_traj: np.ndarray, horizon: int):
 
     states = np.asarray(states, dtype=float)
     if len(states) < 2:
-        return None, None
+        return None
 
     ref_indices = np.linspace(0, len(ref_traj) - 1, len(states)).astype(int)
     ref_interp = ref_traj[ref_indices]
@@ -323,10 +367,13 @@ def run_reference_trajectory(traj_type, speed, horizon):
 def _guidance_text() -> str:
     return (
         "Reference input guide:\n"
-        "1) Use either columns x,y (meters) OR s,offset.\n"
+        "1) Use one of: x,y OR s,offset OR x,y,heading,velocity,time.\n"
         "2) s is normalized path position in [0, 1].\n"
         f"3) offset must stay within +/-{HALF_WIDTH_MARGIN:.2f} m.\n"
-        "4) Provide at least 4 points; points should move forward along the road."
+        "4) heading can be radians or degrees.\n"
+        "5) time (or t) must be strictly increasing (seconds).\n"
+        "6) velocity (or v/vx) should be in m/s.\n"
+        "7) Provide at least 4 points; points should move forward along the road."
     )
 
 
@@ -381,18 +428,46 @@ def _load_points_from_file(file_obj):
 
     keys = set(rows[0].keys())
     points = []
-    if {"x", "y"}.issubset(keys):
+    heading = None
+    t = None
+    velocity = None
+    schema = ""
+    time_key = "time" if "time" in keys else ("t" if "t" in keys else None)
+    if {"x", "y", "heading"}.issubset(keys) and time_key is not None:
         for row in rows:
             x = float(row["x"])
             y = float(row["y"])
             points.append([x, y])
+        heading = np.asarray([float(row["heading"]) for row in rows], dtype=float)
+        t = np.asarray([float(row[time_key]) for row in rows], dtype=float)
+        if np.any(np.diff(t) <= 0):
+            raise ValueError("Column time (or t) must be strictly increasing.")
+        vel_key = None
+        for candidate in ("velocity", "v", "vx"):
+            if candidate in keys:
+                vel_key = candidate
+                break
+        if vel_key is not None:
+            velocity = np.asarray([float(row[vel_key]) for row in rows], dtype=float)
+            if np.any(velocity <= 0):
+                raise ValueError("velocity values must be positive.")
+            schema = f"xy_heading_time_{vel_key}"
+        else:
+            schema = "xy_heading_time"
+    elif {"x", "y"}.issubset(keys):
+        for row in rows:
+            x = float(row["x"])
+            y = float(row["y"])
+            points.append([x, y])
+        schema = "xy"
     elif {"s", "offset"}.issubset(keys):
         for row in rows:
             s = float(row["s"])
             offset = float(row["offset"])
             points.append(_center_point_from_s_offset(s, offset).tolist())
+        schema = "s_offset"
     else:
-        raise ValueError("Expected columns x,y or s,offset.")
+        raise ValueError("Expected columns x,y OR s,offset OR x,y,heading,velocity,time.")
 
     points = np.asarray(points, dtype=float)
     if len(points) < 4:
@@ -405,16 +480,23 @@ def _load_points_from_file(file_obj):
     for p in points:
         if not _is_on_road(float(p[0]), float(p[1])):
             raise ValueError("One or more points are outside road bounds.")
-    return points
+    return {"points": points, "heading": heading, "t": t, "velocity": velocity, "schema": schema}
 
 
 def run_uploaded_reference_mpc(file_obj, speed, horizon):
     try:
-        points = _load_points_from_file(file_obj)
+        data = _load_points_from_file(file_obj)
     except Exception as exc:
         return f"Upload validation failed: {exc}\n\n{_guidance_text()}", None
 
-    ref_traj = _reference_from_xy(points, speed)
+    points = data["points"]
+    ref_traj = _reference_from_xy(
+        points,
+        speed,
+        heading=data["heading"],
+        t=data["t"],
+        v_profile=data["velocity"],
+    )
     metrics = _run_mpc_on_reference(ref_traj, horizon)
     if metrics is None:
         return "MPC failed to run on uploaded reference. Try a smoother file.", None
@@ -426,7 +508,8 @@ def run_uploaded_reference_mpc(file_obj, speed, horizon):
         metrics,
         [
             f"- Input points: {len(points)}",
-            "- Accepted formats: x,y or s,offset.",
+            f"- Parsed schema: {data['schema']}",
+            "- Accepted formats: x,y OR s,offset OR x,y,heading,velocity,time.",
             _guidance_text(),
         ],
     )
@@ -492,7 +575,7 @@ with demo:
 
     with gr.Tab("Upload Reference"):
         gr.Markdown(
-            "Upload a reference file with columns `x,y` or `s,offset`. "
+            "Upload a reference file with columns `x,y` OR `s,offset` OR `x,y,heading,velocity,time`. "
             "Use `s` in [0,1] and keep `offset` within lane limits."
         )
         template_btn = gr.Button("Generate CSV Template")
