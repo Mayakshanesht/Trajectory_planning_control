@@ -15,18 +15,22 @@ This project demonstrates trajectory tracking with a linearized Model Predictive
 
 ## Quick start (Conda recommended)
 ```bash
+git clone https://github.com/Mayakshanesht/Trajectory_planning_control.git
+cd Trajectory_planning_control
 conda create -n mpc-tracking python=3.12 -y
 conda activate mpc-tracking
+cd realistic_mpc_tracking/
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 python launcher.py --interface web
 ```
 
-Then open the Gradio URL printed in terminal (default is usually `http://127.0.0.1:7860`).
+Then open the Gradio URL printed in terminal (usually `https://fed54f4a7ec2def83f.gradio.live`).
 
 ## Reinstall in the Conda env (if dependencies got mixed)
 ```bash
 conda activate mpc-tracking
+cd realistic_mpc_tracking/
 pip install --upgrade --force-reinstall -r requirements.txt
 python launcher.py --interface web
 ```
@@ -83,6 +87,7 @@ Inside `control/mpc.py`:
 
 ## CLI mode
 ```bash
+cd realistic_mpc_tracking/
 python launcher.py --interface cli
 ```
 
